@@ -8,11 +8,14 @@ import qs.Ui
 /**
  * Hermes-modell i toppbaren.
  *
- * Visar Hermes nuvarande standardmodell. Klick öppnar en dropdown med allt
- * Hermes har sparat: model_aliases, model.aliases och de provider-kataloger
- * Hermes själv har cachat. Ett val skriver model.default/model.provider (och
- * base_url när målet har en egen endpoint) via `hermes config set` — alltså
- * samma nycklar som `hermes` egen `/model … --global` sätter.
+ * Visar Hermes nuvarande standardmodell. Klick öppnar en dropdown med det
+ * Hermes faktiskt har tillgång till — katalogen byggs av Hermes eget inventory
+ * (providers med giltiga credentials) plus aliasen i config.yaml.
+ *
+ * Ett val kör Hermes EGEN switch-pipeline (model_switch.switch_model) och
+ * persisteras med samma fyra nycklar som `/model … --global` skriver. Skydden
+ * för dyr modell/datapolicy körs först: svarar de confirm_required visas
+ * bekräftelsen i popupen i stället för att bytet sker tyst.
  *
  * Bytet gäller standardmodellen, dvs nya Hermes-sessioner. En redan pågående
  * session behåller sin modell; det står också i popupens fotnot.
@@ -22,7 +25,7 @@ BarWidget {
   moduleName: "custom.hermes-model"
 
   readonly property string helperPath: Quickshell.env("HOME") + "/.config/omarchy/plugins/custom.hermes-model/hermes_models.py"
-  readonly property int refreshInterval: 15000
+  readonly property int refreshInterval: 20000
   // Nerd Font-robotens kodpunkt sätts via fromCodePoint så att filen inte
   // innehåller multi-byte-glyfer som kan striptas av redigeringsverktyg.
   readonly property string glyph: String.fromCodePoint(0xF06A9)
@@ -30,28 +33,30 @@ BarWidget {
   property bool popupOpen: false
   property bool loading: true
   property bool switching: false
+  property bool refreshing: false
   property string errorText: ""
   property var current: ({ "model": "", "provider": "", "base_url": "" })
   property var groups: []
+  property string source: ""
+  property var catalogAge: null
+  // Väntande byte som Hermes vill ha bekräftat (dyr modell/datapolicy).
+  property var pendingItem: null
+  property string pendingMessage: ""
 
   function close() { popupOpen = false }
 
   implicitWidth: barRow.implicitWidth + Style.space(14)
   implicitHeight: barSize
 
-  function refresh() {
-    if (!listProc.running) listProc.running = true
-  }
-
-  function applyItem(item) {
-    if (!item || root.switching) return
-    root.switching = true
-    root.errorText = ""
-    switchProc.command = [
-      "python3", root.helperPath, "set",
-      item.model || "", item.provider || "", item.base_url || ""
-    ]
-    switchProc.running = true
+  function sourceLabel() {
+    if (root.source === "hermes-api") {
+      var age = root.catalogAge
+      if (age === null || age === undefined) return "Hermes-katalog"
+      if (age < 90) return "Hermes-katalog · färsk"
+      if (age < 3600) return "Hermes-katalog · " + Math.round(age / 60) + " min"
+      return "Hermes-katalog · " + Math.round(age / 3600) + " h"
+    }
+    return "config.yaml (Hermes-API:t otillgängligt)"
   }
 
   function barColor() {
@@ -62,8 +67,35 @@ BarWidget {
     return Qt.darker(root.barColor(), factor)
   }
 
+  function refreshCatalog() {
+    if (listProc.running) return
+    root.refreshing = true
+    listProc.command = ["python3", root.helperPath, "list", "--refresh"]
+    listProc.running = true
+  }
+
+  function refreshCheap() {
+    if (listProc.running) return
+    listProc.command = ["python3", root.helperPath, "list"]
+    listProc.running = true
+  }
+
+  function applyItem(item, confirm) {
+    if (!item || root.switching) return
+    root.switching = true
+    root.errorText = ""
+    if (!confirm) {
+      root.pendingItem = null
+      root.pendingMessage = ""
+    }
+    var cmd = ["python3", root.helperPath, "set", item.model || "", item.provider || ""]
+    if (confirm) cmd.push("--confirm")
+    switchProc.command = cmd
+    switchProc.running = true
+  }
+
   // ---------------------------------------------------------------------------
-  // 1. Läsning (ingen nätverksåtkomst: config.yaml + Hermes modellcache)
+  // 1. Läsning
   // ---------------------------------------------------------------------------
   Process {
     id: listProc
@@ -73,6 +105,7 @@ BarWidget {
       waitForEnd: true
       onStreamFinished: {
         root.loading = false
+        root.refreshing = false
         var raw = text.trim()
         if (raw.length === 0) {
           root.errorText = "tomt svar från hermes_models.py"
@@ -83,6 +116,9 @@ BarWidget {
           if (data && data.ok) {
             root.current = data.current || root.current
             root.groups = data.groups || []
+            root.source = data.source || ""
+            root.catalogAge = (data.catalog_age_s === undefined || data.catalog_age_s === null)
+                             ? null : data.catalog_age_s
             root.errorText = ""
           } else {
             root.errorText = (data && data.error) ? data.error : "okänt fel"
@@ -95,7 +131,7 @@ BarWidget {
   }
 
   // ---------------------------------------------------------------------------
-  // 2. Bytet
+  // 2. Bytet (Hermes egen pipeline)
   // ---------------------------------------------------------------------------
   Process {
     id: switchProc
@@ -104,20 +140,27 @@ BarWidget {
       waitForEnd: true
       onStreamFinished: {
         root.switching = false
-        var raw = text.trim()
         var data = null
         try {
-          data = JSON.parse(raw)
+          data = JSON.parse(text.trim())
         } catch (e) {
           data = null
         }
         if (data && data.ok) {
+          root.pendingItem = null
+          root.pendingMessage = ""
           root.popupOpen = false
+          root.errorText = ""
+        } else if (data && data.confirm_required) {
+          // Inget är ändrat: Hermes vill ha ett uttryckligt ja.
+          root.pendingMessage = data.confirm_message || "Hermes vill ha en bekräftelse"
           root.errorText = ""
         } else {
           root.errorText = (data && data.error) ? data.error : "bytet misslyckades"
+          root.pendingItem = null
+          root.pendingMessage = ""
         }
-        root.refresh()
+        root.refreshCheap()
       }
     }
   }
@@ -127,7 +170,7 @@ BarWidget {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.refresh()
+    onTriggered: if (!root.popupOpen) root.refreshCheap()
   }
 
   // ---------------------------------------------------------------------------
@@ -139,7 +182,6 @@ BarWidget {
     spacing: Style.space(5)
 
     Text {
-      id: barGlyph
       anchors.verticalCenter: parent.verticalCenter
       color: root.switching ? Color.accent : root.barColor()
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -183,11 +225,11 @@ BarWidget {
 
     onClicked: function(mouse) {
       if (mouse.button === Qt.RightButton) {
-        root.refresh()
+        root.refreshCatalog()
         return
       }
       root.popupOpen = !root.popupOpen
-      if (root.popupOpen) root.refresh()
+      if (root.popupOpen) root.refreshCheap()
     }
   }
 
@@ -200,7 +242,7 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
-    contentWidth: popup.fittedContentWidth(Style.space(400))
+    contentWidth: popup.fittedContentWidth(Style.space(430))
     contentHeight: popup.fittedContentHeight(popCol.implicitHeight)
 
     Column {
@@ -222,7 +264,7 @@ BarWidget {
         }
 
         Column {
-          width: parent.width - Style.space(130)
+          width: parent.width - Style.space(150)
           spacing: Style.space(2)
 
           Text {
@@ -239,20 +281,64 @@ BarWidget {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
             text: root.switching
-                  ? "Byter …"
+                  ? "Kör Hermes switch …"
                   : ("Aktiv nu: " + (root.current.model || "?")
-                     + (root.current.provider ? "  ·  " + root.current.provider : ""))
+                     + (root.current.provider ? "  ·  " + root.current.provider : "")
+                     + "   —   " + root.sourceLabel())
             width: parent.width
           }
         }
 
-        WidgetButton {
+        Row {
           anchors.verticalCenter: parent.verticalCenter
-          bar: root.bar
-          fixedHeight: Style.space(30)
-          text: "󰑐"
-          tooltipText: "Läs om modellistan nu"
-          onPressed: function() { root.refresh() }
+          spacing: Style.space(6)
+
+          WidgetButton {
+            bar: root.bar
+            fixedHeight: Style.space(30)
+            text: "󰑐"
+            tooltipText: "Läs om katalogen från Hermes nu"
+            onPressed: function() { root.refreshCatalog() }
+          }
+        }
+      }
+
+      // Bekräftelse (dyr modell / datapolicy)
+      BorderSurface {
+        width: parent.width
+        height: confirmCol.implicitHeight + Style.space(16)
+        radius: Style.spacing.labelGap
+        borderSpec: Border.controlSpec("normal", root.barColor(), Color.accent)
+        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.10)
+        visible: root.pendingMessage.length > 0
+
+        Column {
+          id: confirmCol
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(6)
+
+          Text {
+            color: root.barColor()
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            text: root.pendingMessage
+            wrapMode: Text.WordWrap
+            width: parent.width
+          }
+
+          WidgetButton {
+            bar: root.bar
+            fixedHeight: Style.space(26)
+            text: "Bekräfta och byt"
+            tooltipText: "Kör bytet med Hermes bekräftelse"
+            onPressed: function() {
+              if (root.pendingItem) root.applyItem(root.pendingItem, true)
+            }
+          }
         }
       }
 
@@ -281,19 +367,8 @@ BarWidget {
         color: root.dimColor(1.4)
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.bodySmall
-        text: "Läser Hermes-konfigurationen …"
-        visible: root.loading && root.groups.length === 0
-      }
-
-      // Ingen träff
-      Text {
-        color: root.dimColor(1.4)
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: Style.font.bodySmall
-        text: "Inga sparade modeller hittades i config.yaml eller Hermes modellcache."
-        visible: !root.loading && root.groups.length === 0
-        width: parent.width
-        wrapMode: Text.WordWrap
+        text: root.refreshing ? "Hämtar Hermes katalog …" : "Läser Hermes-konfigurationen …"
+        visible: (root.loading || root.refreshing) && root.groups.length === 0
       }
 
       // Modellistan
@@ -362,7 +437,7 @@ BarWidget {
                       width: parent.width - Style.space(60)
 
                       Text {
-                        color: root.barColor()
+                        color: itemRow.item.available === false ? root.dimColor(1.6) : root.barColor()
                         elide: Text.ElideRight
                         font.bold: true
                         font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -372,7 +447,9 @@ BarWidget {
                       }
 
                       Text {
-                        color: root.dimColor(1.35)
+                        color: (itemRow.item.available === false || itemRow.item.is_current)
+                               ? (itemRow.item.available === false ? "#f0b46a" : root.dimColor(1.35))
+                               : root.dimColor(1.35)
                         elide: Text.ElideRight
                         font.family: root.bar ? root.bar.fontFamily : Style.font.family
                         font.pixelSize: Style.font.caption
@@ -408,7 +485,10 @@ BarWidget {
                     cursorShape: Qt.PointingHandCursor
                     enabled: !root.switching
                     hoverEnabled: true
-                    onClicked: root.applyItem(itemRow.item)
+                    onClicked: {
+                      root.pendingItem = itemRow.item
+                      root.applyItem(itemRow.item, false)
+                    }
                   }
                 }
               }
@@ -417,12 +497,12 @@ BarWidget {
         }
       }
 
-      // Fotnot: vad bytet betyder
+      // Fotnot
       Text {
         color: root.dimColor(1.4)
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
-        text: "Sätter Hermes standardmodell (config.yaml) — nya sessioner. Källor: model_aliases, model.aliases, provider_models_cache."
+        text: "Bytet kör Hermes egen switch och sätter standardmodellen i config.yaml — nya sessioner. Kör en pågående chatt vidare på sin modell."
         width: parent.width
         wrapMode: Text.WordWrap
       }
