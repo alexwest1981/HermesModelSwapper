@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "custom.hermes-model",
+  "name": "Hermes Model",
+  "version": "0.1.0",
+  "author": "Alex Weström",
+  "description": "Byt Hermes standardmodell direkt från baren — alla modeller och alias som Hermes har sparade.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Hermes Model",
+    "description": "Hermes standardmodell, med dropdown över sparade modeller och alias.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
